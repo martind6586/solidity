@@ -161,6 +161,8 @@ void EVMHost::reset()
 	recorded_calls.clear();
 	// Clear EIP-2929 account access indicator
 	recorded_account_accesses.clear();
+	m_newlyCreatedAccounts.clear();
+	m_totalCodeDepositGas = 0;
 
 	// Mark all precompiled contracts as existing. Existing here means to have a balance (as per EIP-161).
 	// NOTE: keep this in sync with `EVMHost::call` below.
@@ -197,12 +199,13 @@ void EVMHost::newTransactionFrame()
 	}
 	// Process selfdestruct list
 	for (auto& [address, _]: recorded_selfdestructs)
-		if (m_evmVersion < langutil::EVMVersion::cancun() || newlyCreatedAccounts.count(address))
+		if (m_evmVersion < langutil::EVMVersion::cancun() || m_newlyCreatedAccounts.count(address))
 			// EIP-6780: If SELFDESTRUCT is executed in a transaction different from the one
 			// in which it was created, we do NOT record it or clear any data.
 			// Otherwise, the previous behavior (pre-Cancun) is maintained.
 			accounts.erase(address);
-	newlyCreatedAccounts.clear();
+	m_newlyCreatedAccounts.clear();
+	m_totalCodeDepositGas = 0;
 	recorded_selfdestructs.clear();
 }
 
@@ -356,7 +359,8 @@ evmc::Result EVMHost::call(evmc_message const& _message) noexcept
 	auto& destination = accounts[message.recipient];
 	if (message.kind == EVMC_CREATE || message.kind == EVMC_CREATE2)
 		// Mark account as created if it is a CREATE or CREATE2 call
-		newlyCreatedAccounts.emplace(message.recipient);
+		// TODO: Should we roll changes back on failure like we do for `accounts`?
+		m_newlyCreatedAccounts.emplace(message.recipient);
 
 	if (value != 0 && message.kind != EVMC_DELEGATECALL && message.kind != EVMC_CALLCODE)
 	{
@@ -392,15 +396,18 @@ evmc::Result EVMHost::call(evmc_message const& _message) noexcept
 
 	if (message.kind == EVMC_CREATE || message.kind == EVMC_CREATE2)
 	{
-		result.gas_left -= static_cast<int64_t>(evmasm::GasCosts::createDataGas * result.output_size);
+		int64_t codeDepositGas = static_cast<int64_t>(evmasm::GasCosts::createDataGas * result.output_size);
+		result.gas_left -= codeDepositGas;
 		if (result.gas_left < 0)
 		{
+			m_totalCodeDepositGas += -result.gas_left;
 			result.gas_left = 0;
 			result.status_code = EVMC_OUT_OF_GAS;
 			// TODO clear some fields?
 		}
 		else
 		{
+			m_totalCodeDepositGas += codeDepositGas;
 			result.create_address = message.recipient;
 			destination.code = evmc::bytes(result.output_data, result.output_data + result.output_size);
 			destination.codehash = convertToEVMC(keccak256({result.output_data, result.output_size}));
